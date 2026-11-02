@@ -1,0 +1,9 @@
+*.exe
+*.pyc
+.env
+.venv/
+__pycache__/
+build/
+dist/
+testes/logs/
+venv/
