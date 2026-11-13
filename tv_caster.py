@@ -421,6 +421,9 @@ class MkvInfo:
     def subs(self):
         return [t for t in self.tracks if t["type"] == 17]
 
+    def audios(self):
+        return [t for t in self.tracks if t["type"] == 2]
+
 
 def mkv_info(path):
     """Cabeçalho de um MKV/WebM (faixas, escala de tempo). None se não for MKV legível."""
@@ -437,7 +440,7 @@ def mkv_info(path):
 
     def entry(i, end, start, stop):
         tr = {"number": 0, "uid": 0, "type": 0, "codec": "", "lang": "", "name": "",
-              "start": start, "end": stop}
+              "channels": 0, "default": True, "start": start, "end": stop}
         while i < end:
             try:
                 eid, l1 = _vint(buf, i, True)
@@ -461,6 +464,19 @@ def mkv_info(path):
                 tr["lang"] = raw.decode("ascii", "ignore").strip("\0")
             elif eid == 0x536E:
                 tr["name"] = raw.decode("utf-8", "replace").strip("\0")
+            elif eid == 0x88:                                   # FlagDefault
+                tr["default"] = bool(int.from_bytes(raw, "big"))
+            elif eid == 0xE1:                                   # Audio: canais
+                j = 0
+                while j < len(raw):
+                    try:
+                        sid, a = _vint(raw, j, True)
+                        ssz, b = _vint(raw, j + a, False)
+                    except (ValueError, IndexError):
+                        break
+                    if sid == 0x9F:
+                        tr["channels"] = int.from_bytes(raw[j + a + b:j + a + b + ssz], "big")
+                    j += a + b + ssz
             i = nxt
         return tr
 
@@ -792,6 +808,11 @@ def connect_ip(ip):
 # Servidor HTTP: entrega arquivos para a TV e a página de controle do celular
 # --------------------------------------------------------------------------
 class _QuietServer(ThreadingHTTPServer):
+    # No Windows, SO_REUSEADDR deixa DOIS programas abrirem a mesma porta; aí o pedido da TV
+    # cai na instância errada (404 -> a TV responde "716 Resource not found"). Sem ele, a
+    # segunda cópia do TV Caster cai para a porta seguinte (8766...).
+    allow_reuse_address = os.name != "nt"
+
     def handle_error(self, request, client_address):
         pass  # TV/celular fecharam a conexão no meio (seek, stop, página fechada) - normal
 
@@ -944,7 +965,7 @@ def _probe(ff, path):
     return {"duration": dur, "vcodec": v.group(1).lower() if v else ""}
 
 
-def convert_media(path, is_audio, tmpdir, progress=None, cancelled=None):
+def convert_media(path, is_audio, tmpdir, progress=None, cancelled=None, audio=None):
     """MP4 (H.264+AAC) ou MP3. Vídeo já em H.264: só o áudio é convertido (rápido)."""
     ff = find_ffmpeg()
     if not ff:
@@ -956,13 +977,14 @@ def convert_media(path, is_audio, tmpdir, progress=None, cancelled=None):
     else:
         vid = (["-c:v", "copy"] if info["vcodec"] == "h264" else
                ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p"])
-        enc = ["-map", "0:v:0", "-map", "0:a:0?", *vid,
+        enc = ["-map", "0:v:0", "-map", f"0:a:{audio}" if audio is not None else "0:a:0?", *vid,
                "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-movflags", "+faststart"]
     return _run_ffmpeg(ff, path, enc, out, info["duration"], tmpdir, progress, cancelled)
 
 
-def mkv_without_subs(path, tmpdir, progress=None, cancelled=None):
-    """Cópia do MKV sem as faixas de legenda (só copia os dados, não recodifica).
+def mkv_remux(path, tmpdir, progress=None, cancelled=None, audio=None, keep_subs=False):
+    """Cópia do MKV só com a faixa de áudio escolhida (nº na ordem das faixas de áudio;
+    None = todas) e, por padrão, sem as faixas de legenda. Só copia os dados, não recodifica.
 
     Tirar só a faixa do cabeçalho não serve: os blocos de legenda continuam dentro do
     vídeo e a TV perde quadros (pixelado/pulando) a cada fala. Exige espaço livre ~ tamanho do arquivo.
@@ -973,7 +995,8 @@ def mkv_without_subs(path, tmpdir, progress=None, cancelled=None):
     if shutil.disk_usage(tmpdir).free < os.path.getsize(path) * 1.05 + (256 << 20):
         raise RuntimeError("sem espaço livre no disco temporário")
     out = os.path.join(tmpdir, uuid.uuid4().hex + ".mkv")
-    enc = ["-map", "0:v", "-map", "0:a?", "-map_chapters", "0", "-sn", "-dn", "-c", "copy"]
+    enc = ["-map", "0:v", "-map", f"0:a:{audio}" if audio is not None else "0:a?",
+           *(["-map", "0:s?"] if keep_subs else ["-sn"]), "-map_chapters", "0", "-dn", "-c", "copy"]
     return _run_ffmpeg(ff, path, enc, out, _probe(ff, path)["duration"], tmpdir, progress, cancelled)
 
 
@@ -1950,7 +1973,7 @@ li.cur .t{color:var(--acc);font-weight:600}
   </div>
   <div class="sub" id="subinfo" style="margin-top:8px"></div>
 </div>
-<div class="seg"><button id="tq" class="on">Fila</button><button id="tl">Biblioteca</button><button id="ts">Legendas</button><button id="tw">Ao vivo</button></div>
+<div class="seg"><button id="tq" class="on">Fila</button><button id="tl">Biblioteca</button><button id="ts">Faixas</button><button id="tw">Ao vivo</button></div>
 <section id="sq"><ul id="queue"></ul><div class="empty" id="empty">A fila está vazia. Adicione itens na Biblioteca.</div></section>
 <section id="sl" hidden></section>
 <section id="sv" hidden></section>
@@ -1993,7 +2016,11 @@ function render(){
 function drawQueue(){const ul=$('#queue');ul.replaceChildren();S.playlist.forEach((t,i)=>{const li=document.createElement('li');if(i===S.current)li.className='cur';
  const b=document.createElement('button');b.className='row';const sp=document.createElement('span');sp.className='t';sp.textContent=t;b.append(sp);b.onclick=()=>send('play_index',{i});
  const x=document.createElement('button');x.className='x';x.textContent='×';x.onclick=()=>send('remove',{i});li.append(b,x);ul.append(li)});$('#empty').hidden=S.playlist.length>0}
-function drawSubs(){const box=$('#ss');if(!box)return;const k=JSON.stringify([S.subs,S.subopts]);if(box.dataset.k===k)return;box.dataset.k=k;box.replaceChildren();
+function drawSubs(){const box=$('#ss');if(!box)return;const ao=S.audioopts||[];const k=JSON.stringify([S.subs,S.subopts,ao]);if(box.dataset.k===k)return;box.dataset.k=k;box.replaceChildren();
+ if(ao.length){const h=document.createElement('div');h.className='sub';h.textContent='Faixa de áudio';h.style.margin='0 0 6px';box.append(h);
+  const au=document.createElement('ul');au.style.marginBottom='16px';ao.forEach((o,i)=>{const li=document.createElement('li');if(o.sel)li.className='cur';const r=document.createElement('button');r.className='row';
+   const sp=document.createElement('span');sp.className='t';sp.textContent=(o.sel?'●  ':'○  ')+o.label;r.append(sp);r.onclick=()=>{if(!o.sel){send('audio_choice',{i});toast('Trocando o áudio…')}};li.append(r);au.append(li)});box.append(au);
+  const h2=document.createElement('div');h2.className='sub';h2.textContent='Legendas';h2.style.margin='0 0 6px';box.append(h2)}
  const bar=document.createElement('div');bar.className='bar';const p=document.createElement('div');p.className='path';p.textContent=S.subs?'Legendas ligadas':'Legendas desligadas';
  const b=document.createElement('button');b.className='pill';b.textContent=S.subs?'Desligar tudo':'Ligar';b.onclick=()=>send('subs');bar.append(p,b);box.append(bar);
  if(!S.subopts.length){const e=document.createElement('div');e.className='empty';e.textContent='Toque algo para escolher a legenda.';box.append(e);return}
@@ -2190,7 +2217,8 @@ class App:
         self.user_stopped = False
         self.muted = False
         self.converted = {}
-        self.stripped = {}        # caminho -> cópia sem legendas embutidas (na pasta temporária)
+        self.prepared = {}        # (caminho, faixa de áudio, manter legendas) -> cópia na pasta temporária
+        self.audio_choice = {}    # caminho -> nº da faixa de áudio escolhida (sem entrada = padrão do arquivo)
         self.alive = True
 
         self._build_ui()
@@ -2252,12 +2280,14 @@ class App:
         acts = tk.Frame(lib, bg=CARD)
         acts.pack(fill="x", padx=px(10), pady=(px(2), px(12)))
         for txt, cmd in (("+ Arquivos", self.add_files), ("+ Pasta", self.add_folder),
-                         ("Legenda…", self._open_sub_menu), ("Remover", self.remove_sel),
-                         ("Limpar", self.clear_list)):
+                         ("Legenda…", self._open_sub_menu), ("Áudio…", self._open_audio_menu),
+                         ("Remover", self.remove_sel), ("Limpar", self.clear_list)):
             b = Btn(acts, txt, cmd, "ghost")
             b.pack(side="left", padx=2)
             if txt == "Legenda…":
                 self.sub_btn = b
+            elif txt == "Áudio…":
+                self.audio_btn = b
         Btn(acts, "↓", lambda: self.move(1), "ghost", pad=12).pack(side="right", padx=2)
         Btn(acts, "↑", lambda: self.move(-1), "ghost", pad=12).pack(side="right", padx=2)
 
@@ -2381,7 +2411,16 @@ class App:
             "screens": screen_labels(self.screens),
             "subs": self.sub_var.get(), "subdesc": self.sub_text,
             "subopts": self._snap_subopts(),
+            "audioopts": self._snap_audioopts(),
         }
+
+    def _snap_audioopts(self):
+        cur = self.current
+        if not 0 <= cur < len(self.playlist):
+            return []
+        p = self.playlist[cur]
+        eff = self.audio_effective(p)
+        return [{"label": label, "sel": n == eff} for n, label in self.audio_options(p)]
 
     def _snap_subopts(self):
         cur = self.current
@@ -2602,6 +2641,82 @@ class App:
             opts.append((("ext", p), "Arquivo: " + os.path.basename(p), True))
         return opts
 
+    # ---------------- faixa de áudio ----------------
+    CH_NAMES = {1: "1.0", 2: "2.0", 3: "2.1", 6: "5.1", 8: "7.1"}
+
+    def audio_tracks(self, path):
+        info = self._mkv(path)
+        return info.audios() if info else []
+
+    def audio_default(self, path):
+        tr = self.audio_tracks(path)
+        return next((t["number"] for t in tr if t["default"]), tr[0]["number"]) if tr else None
+
+    def audio_effective(self, path):
+        """Nº da faixa de áudio que vale agora (a escolhida, ou a padrão do arquivo)."""
+        n = self.audio_choice.get(path)
+        return n if any(t["number"] == n for t in self.audio_tracks(path)) else self.audio_default(path)
+
+    def audio_index(self, path):
+        """Posição (entre as faixas de áudio) da faixa escolhida; None se for a padrão."""
+        eff = self.audio_effective(path)
+        if eff is None or eff == self.audio_default(path):
+            return None
+        return next(i for i, t in enumerate(self.audio_tracks(path)) if t["number"] == eff)
+
+    def audio_options(self, path):
+        """[(nº da faixa, texto)] — vazio se o arquivo tem menos de duas faixas de áudio."""
+        tr = self.audio_tracks(path)
+        if len(tr) < 2:
+            return []
+        dflt, out = self.audio_default(path), []
+        for t in tr:
+            code = (t["lang"] or "eng").lower()     # sem o campo, o Matroska assume inglês
+            lang = LANG_NAMES.get(code, t["lang"] or "Idioma não informado")
+            codec = re.sub(r"^A_", "", t["codec"]).replace("/", " ")
+            ch = self.CH_NAMES.get(t["channels"], f"{t['channels']} canais" if t["channels"] else "")
+            label = lang + " — " + " ".join(x for x in (codec, ch) if x)
+            if t["name"]:
+                label += f" — {t['name']}"
+            if t["number"] == dflt:
+                label += " (padrão)"
+            out.append((t["number"], label))
+        return out
+
+    def choose_audio(self, path, number):
+        if number == self.audio_effective(path):
+            return
+        self.audio_choice[path] = number
+        if (0 <= self.current < len(self.playlist) and self.playlist[self.current] == path
+                and self._is_active()):
+            self.play_index(self.current, start_at=self.pos)
+        else:
+            self.set_status("Faixa de áudio definida para: " + title_of(path))
+
+    def _open_audio_menu(self):
+        sel = self.lb.curselection()
+        i = self.current if self.current >= 0 else (sel[0] if sel else -1)
+        if not 0 <= i < len(self.playlist):
+            show_info(self.root, "Áudio", "Selecione um item da fila primeiro.")
+            return
+        path = self.playlist[i]
+        opts = self.audio_options(path)
+        if not opts:
+            show_info(self.root, "Áudio", "Este arquivo tem uma única faixa de áudio "
+                      "(a escolha de faixa funciona em arquivos MKV com duas ou mais).")
+            return
+        m = tk.Menu(self.root, tearoff=0, bg=CARD, fg=FG, activebackground=ACC,
+                    activeforeground="#ffffff", bd=0, relief="flat", font=F_UI)
+        eff = self.audio_effective(path)
+        for number, label in opts:
+            m.add_command(label=("✓  " if number == eff else "     ") + label,
+                          command=lambda n=number: self.choose_audio(path, n))
+        b = self.audio_btn
+        try:
+            m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height() + 4)
+        finally:
+            m.grab_release()
+
     def sub_effective(self, path):
         """Escolha valendo agora para o item (a chave 'Legendas' desligada vence)."""
         return self.sub_choice.get(path, "auto") if self.sub_var.get() else "off"
@@ -2789,21 +2904,22 @@ class App:
         self._set_sub_text("")
         self.set_status("Enviando para a TV…")
         warn = []                          # avisos que devem sobreviver ao "Reproduzindo…"
+        aidx = None if is_audio else self.audio_index(path)   # faixa de áudio diferente da padrão
 
         def work():
             mime = MIME.get(os.path.splitext(path)[1].lower(), "video/mp4")
             src = path
             if convert:
-                if path not in self.converted:
+                if (path, aidx) not in self.converted:
                     self.set_status("Convertendo para compatibilidade… 0%")
                     try:
-                        self.converted[path] = convert_media(
+                        self.converted[(path, aidx)] = convert_media(
                             path, is_audio, self.tmpdir,
                             lambda f: self.set_status(f"Convertendo para compatibilidade… {int(f * 100)}%"),
-                            lambda: gen != self.load_gen)
+                            lambda: gen != self.load_gen, aidx)
                     except ConversionCancelled:
                         return
-                src = self.converted[path]
+                src = self.converted[(path, aidx)]
                 mime = "audio/mpeg" if is_audio else "video/mp4"
             ip = local_ip_for(dev.host)
             sub_url = None
@@ -2811,22 +2927,25 @@ class App:
                 srt, strip, self.sub_name = self.resolve_subs(path, choice, warn)
                 if srt:
                     sub_url = self.server.publish(srt, "text/srt;charset=utf-8", ip)
-                if strip and src == path:  # manda à TV uma cópia sem as legendas embutidas
-                    if path not in self.stripped:
-                        self.set_status("Preparando o arquivo sem legendas embutidas… 0%")
+                if src == path and (strip or aidx is not None):
+                    # manda à TV uma cópia sem as legendas embutidas e/ou só com a faixa de áudio escolhida
+                    what = ("com a faixa de áudio escolhida" if aidx is not None
+                            else "sem legendas embutidas")
+                    key = (path, aidx, not strip)
+                    if key not in self.prepared:
+                        self.set_status(f"Preparando o arquivo {what}… 0%")
                         try:
-                            self.stripped[path] = mkv_without_subs(
+                            self.prepared[key] = mkv_remux(
                                 path, self.tmpdir,
-                                lambda f: self.set_status(
-                                    f"Preparando o arquivo sem legendas embutidas… {int(f * 100)}%"),
-                                lambda: gen != self.load_gen)
+                                lambda f: self.set_status(f"Preparando o arquivo {what}… {int(f * 100)}%"),
+                                lambda: gen != self.load_gen, aidx, keep_subs=not strip)
                         except ConversionCancelled:
                             return
                         except Exception as e:
-                            warn.append(f"Não deu para tirar as legendas embutidas ({e}); "
+                            warn.append(f"Não deu para preparar o arquivo {what} ({e}); "
                                         "tocando o original.")
                             self.set_status(warn[-1])
-                    src = self.stripped.get(path, path)
+                    src = self.prepared.get(key, path)
 
             u = self.server.publish(src, mime, ip, {"CaptionInfo.sec": sub_url} if sub_url else None)
             url, meta = u, didl_metadata(title, u, mime, os.path.getsize(src), sub_url)
@@ -3262,6 +3381,13 @@ class App:
                 i = int(d["i"])
                 if 0 <= i < len(opts) and opts[i][2]:
                     self.choose_sub(p, opts[i][0])
+        elif c == "audio_choice":
+            if 0 <= self.current < len(self.playlist):
+                p = self.playlist[self.current]
+                opts = self.audio_options(p)
+                i = int(d["i"])
+                if 0 <= i < len(opts):
+                    self.choose_audio(p, opts[i][0])
         elif c in ("add_file", "add_dir"):
             full = self.remote.resolve(int(d["root"]), d.get("path", ""))
             if c == "add_dir":
